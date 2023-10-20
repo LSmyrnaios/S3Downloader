@@ -1,8 +1,8 @@
 # S3Downloader
 
 This Python script takes a CSV file as input, which contains two columns: "id" and "location".
-- **id**: the id of the record.<br>
-- **location**: the S3-location of the files.<br>
+- **id**: the id of the record<br>
+- **location**: the S3-location of the file<br>
 <br>
 
 ### Requirements:
@@ -15,4 +15,4 @@ This Python script takes a CSV file as input, which contains two columns: "id" a
 `python3 s3downloader.py <input_file.csv> <downloads_dir> <max_files_to_download>`
 
 Notes:<br>
-If we want to download all the files, then we set the "**max_files_to_download**" to **zero**. 
+If you want to download all the files, then set the "**max_files_to_download**" argument, to **zero** (0). 

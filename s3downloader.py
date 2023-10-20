@@ -5,13 +5,14 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-csv_filename = "irish_data.csv"
-downloads_dir = "pdf_downloads"
+csv_filename = "input_data.csv"
+downloads_dir = "S3_downloads"
 max_files_to_download = 100
 
 
 def download_file_from_s3(s3_file_location):
     global downloads_dir
+    result = None
     try:
         result = subprocess.check_output("s3cmd get " + s3_file_location + " " + downloads_dir, shell=True,
                                          executable="/bin/bash", stderr=subprocess.STDOUT)
@@ -20,8 +21,9 @@ def download_file_from_s3(s3_file_location):
         result = cpe.output
         return False
     finally:
-        for line in result.splitlines():
-            print(line.decode())
+        if result is not None:
+            for line in result.splitlines():
+                print(line.decode())
 
 
 def download_multiple_files_from_s3(csv_filename):
@@ -71,12 +73,12 @@ if __name__ == '__main__':
         print("Please give exactly 3 arguments: <csv_filename> <downloads_dir> <max_files_to_download>", file=sys.stderr)
         exit(1)
 
-    csv_filename = sys.argv[1]  # e.g. "irish_data.csv"
+    csv_filename = sys.argv[1]  # e.g. "input_data.csv"
     if not csv_filename.endswith(".csv"):
         print("Please provide a CSV file..", file=sys.stderr)
         exit(2)
 
-    downloads_dir = sys.argv[2]  # e.g. "pdf_downloads"
+    downloads_dir = sys.argv[2]  # e.g. "S3_downloads"
     if not os.path.isdir(downloads_dir):
         print("Will create the downloads_dir: " + downloads_dir.__str__())
         try:
