@@ -1,8 +1,10 @@
 # S3Downloader
 
-This Python script takes a CSV file as input, which contains two columns: "id" and "location".
+This Python script takes a CSV file as input, which contains two columns: "id" and "location".<br>
 - **id**: the id of the record<br>
 - **location**: the S3-location of the file<br>
+
+Then, it downloads the files in parallel, using 20 threads.
 <br>
 
 ### Requirements:
