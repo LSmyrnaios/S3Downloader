@@ -4,7 +4,7 @@ This Python script takes a CSV file as input, which contains two columns: "id" a
 - **id**: the id of the record<br>
 - **location**: the S3-location of the file<br>
 
-Then, it downloads the files in parallel, using 20 threads.
+Then, it downloads the files in parallel.
 <br>
 
 ### Requirements:
@@ -14,7 +14,7 @@ Then, it downloads the files in parallel, using 20 threads.
 
 
 ### Run-instructions:
-`python3 s3downloader.py <input_file.csv> <downloads_dir> <max_files_to_download>`
+`python3 s3downloader.py <csv_filename> <downloads_dir> <max_files_to_download> <num_of_threads> <num_seconds_between_requests_in_each_thread>`
 
 Notes:<br>
 If you want to download all the files, then set the "**max_files_to_download**" argument, to **zero** (0). 
