@@ -1,23 +1,32 @@
 import csv
-import hashlib
 import logging.config
 import os
-import subprocess
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
+
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError, EndpointConnectionError
 
 # Ensure the logs directory exists
 logs_dir = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(logs_dir, exist_ok=True)
 
-config_file_path = os.path.join(os.path.dirname(__file__), 'log.ini')
+current_dir = os.path.abspath(os.path.dirname(__file__))
+config_file_path = os.path.join(current_dir, 'log.ini')
 logging.config.fileConfig(config_file_path)
+
+logging.getLogger('boto3').setLevel(logging.INFO)
+logging.getLogger('botocore').setLevel(logging.INFO)
+logging.getLogger('urllib3').setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 
-input_csv_filename = "input_data.csv"
-downloads_dir = "S3_downloads"
+input_csv_filename = "input_data.csv"   # Will be set by cmd-args.
+downloads_dir = os.path.join(current_dir, "S3_downloads")
 
 max_files_to_download = 100
 num_of_threads = 20
@@ -25,141 +34,190 @@ num_seconds_between_requests_in_each_thread = 5
 batch_size = 10000
 
 should_extract_hash_and_size = True
-should_delete_file_after_calculation = True
 output_data = []
-output_csv_filename = "output_hash_size.csv"
+lock = threading.Lock()
+
+output_csv_filename = "result_data.csv"   # Will be set after the "input_csv_filename", given from cmd-args.
 fieldnames = ['location', 'hash', 'size', 'error']
 
 count_successful_files = 0
 futures_of_threads = []
 
+# The S3-client will use the environment-variables:
+# 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_REGION', 'S3_ENDPOINT' and 'S3_BUCKET'
+expected_bucket = os.getenv('S3_BUCKET')
 
-def get_md5_and_size(filepath):
+def get_s3_client():
     try:
-        md5 = hashlib.md5() # New md5-object for this file.
-        file_size = 0
-        with open(filepath, 'rb') as f:
-            for chunk in iter(lambda: f.read(1_048_576), b''):  # 1MB buffer_size
-                md5.update(chunk)
-                file_size += len(chunk) # The length may be less than 1MB.
-
-        if file_size == 0:
-             logger.warning(f"An empty file was found: {filepath}")
-        #     return "null", 0  # In case we do not want to calculate the hash of empty files.
-        return md5.hexdigest(), file_size
+        return boto3.client(
+            's3',
+            region_name=os.getenv('AWS_REGION'),
+            endpoint_url=os.getenv('S3_ENDPOINT'),
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
+        )
     except Exception as e:
-        logger.error(f"Could not calculate hash and/or size of file '{filepath}': {e}\n{traceback.format_exc()}")
+        logger.error(f"Failed to create S3 client: {e}")
+        raise
+
+
+def parse_s3_location(s3_location):
+    # Extract the bucket_name and the object_key.
+    try:
+        parsed = urlparse(s3_location)
+        bucket_name = parsed.netloc
+        object_key = parsed.path.lstrip('/')
+        if bucket_name and object_key:
+            return bucket_name, object_key  # remove leading slash from the object_key.
+        else:
+            logger.error(f"Failed to parse S3 location: {s3_location}")
+            return None, None
+    except Exception as e:
+        logger.error(f"Failed to parse S3 location '{s3_location}': {e}")
         return None, None
 
 
-def download_file_from_s3(s3_file_location):
-    global downloads_dir, num_seconds_between_requests_in_each_thread, output_data
-    result = None
+def download_file_from_s3(s3_client, s3_location, downloads_dir):
+    bucket_name, object_key = parse_s3_location(s3_location)
+    if bucket_name is None and object_key is None:
+        return False
+
+    if bucket_name != expected_bucket:
+        logger.error(
+            f"The S3_location '{s3_location}' has an unexpected bucket: '{bucket_name}' (not the expected one: '{expected_bucket}')")
+        # Even if its valid, the credentials we use are only applicable for the 'expected_bucket'.
+        return False
+
     try:
-        result = subprocess.check_output("s3cmd get " + s3_file_location + " " + downloads_dir, shell=True,
-                                         executable="/bin/bash", stderr=subprocess.STDOUT)
-
-        if should_extract_hash_and_size:
-            filepath = os.path.join(downloads_dir, os.path.basename(s3_file_location))
-            file_hash, file_size = get_md5_and_size(filepath)
-            if file_hash and file_size:  # in case of an exception both will be None, otherwise we want
-                logger.info(f"Downloaded file '{filepath}' with hash '{file_hash}' and size: {file_size}")
-                output_data.append({
-                    'location': s3_file_location,
-                    'hash': file_hash,
-                    'size': file_size,
-                    'error': "null"
-                })
-            else:
-                logger.error(f"Failed to extract hash ({file_hash}) and size ({file_size})!")
-                output_data.append({
-                    'location': s3_file_location,
-                    'hash': 'null',
-                    'size': 'null',
-                    'error': "hash and size calculation problem"
-                })
-                return False
-            if should_delete_file_after_calculation:
-                os.remove(filepath)
-        return True
-    except subprocess.CalledProcessError as cpe:
-        if cpe.returncode in [2, 3, 4, 5, 6, 10, 11]:
-            logger.error(f"Serious S3 error: {cpe}\nExiting the main process..")
-            exit(99)
-
-        result = cpe.output
-        if cpe.returncode == 12:
-            logger.error(f"File not found: {s3_file_location}")
-            if should_extract_hash_and_size:
-                output_data.append({
-                    'location': s3_file_location,
-                    'hash': 'null',
-                    'size': 'null',
-                    'error': "location not found"
-                })
-        else:
-            logger.error(f"Failed to download file '{s3_file_location}': {cpe}")
-            if result is not None and should_extract_hash_and_size:
-                output_data.append({
-                    'location': s3_file_location,
-                    'hash': 'null',
-                    'size': 'null',
-                    'error': result.replace(",", ";")   # Make sure it's a proper csv column
-                })
-            elif should_extract_hash_and_size:
-                output_data.append({
-                    'location': s3_file_location,
-                    'hash': 'null',
-                    'size': 'null',
-                    'error': f's3cmd {cpe.returncode} code'   # Make sure it's a proper csv column
-                })
-        return False
-    except Exception as e:
-        logger.error(f"Failed to download file '{s3_file_location}': {e}\n{traceback.format_exc()}")
-        if should_extract_hash_and_size:
-            output_data.append({
-                'location': s3_file_location,
-                'hash': 'null',
-                'size': 'null',
-                'error': str(e).replace(",", ";")    # Make sure it's a proper csv column
-            })
-        return False
-    finally:
-        if logger.isEnabledFor(logging.DEBUG) and result is not None:
-            strings = []
-            for line in result.splitlines():
-                decoded_line = line.decode("utf-8")
-                if "%" in decoded_line and not "100%" in decoded_line:  # Do not show intermediate progress of individual files, in the logs.
-                    continue
-                strings.append(decoded_line)
-            logger.debug(''.join(strings))
+        local_file_path = os.path.join(downloads_dir, object_key.split('/')[1])
+        s3_client.download_file(bucket_name, object_key, local_file_path)
+        logger.info(f"Downloaded '{s3_location}'.")
 
         # Sleep a bit to avoid overloading the server.
         if num_seconds_between_requests_in_each_thread > 0:
             time.sleep(num_seconds_between_requests_in_each_thread)
 
+        return True
+    except Exception as e:
+        if isinstance(e, ClientError):
+            logger.error(f"Failed to download file '{s3_location}': {e.response['Error']['Message']}")
+        elif isinstance(e, NoCredentialsError):
+            logger.error("S3 credentials not found.")
+        elif isinstance(e, EndpointConnectionError):
+            logger.error(f"Connection error: {str(e)}")
+        else:
+            error_msg = str(e)
+            if "Parameter validation failed" in error_msg:
+                logger.error(f"Error when validating parameters 'bucket_name': '{bucket_name}' and 'object_key': '{object_key}'")
+            else:
+                logger.error(f"Unexpected error when downloading file '{s3_location}': {str(e)}")
+        return False
+
+
+def get_metadata(s3_client, s3_location):
+    bucket_name, object_key = parse_s3_location(s3_location)
+    error_msg = None
+    if bucket_name is None and object_key is None:
+        error_msg = "malformed location"
+    elif bucket_name != expected_bucket:
+        logger.error(
+            f"The S3_location '{s3_location}' has an unexpected bucket: '{bucket_name}' (instead of: '{expected_bucket}')")
+        error_msg = f"unexpected bucket: {bucket_name}"
+        # Even if its valid, the credentials we use are only applicable for the 'expected_bucket'.
+
+    if error_msg:
+        output_row = {'location': s3_location, 'hash': "null", 'size': "null", 'error': error_msg}
+        with lock:
+            output_data.append(output_row)
+        return False
+
+    try:
+        response = s3_client.head_object(Bucket= bucket_name, Key=object_key)
+        error_msg = "null"
+        md5_hash = response['ETag'].strip('"')
+        if '-' in md5_hash:
+            error_msg = "multipart file"
+            logger.warning(f"Found a {error_msg}, for which we cannot get its md5Sum: {s3_location}")
+            md5_hash = "null"
+            # In this case, the 'size' represents the whole object, so we can at least get that.
+
+        size = response['ContentLength']
+        if size == "0":
+            error_msg = "empty file"
+            logger.warning(f"Found an {error_msg}: {s3_location}")
+            md5_hash = "null"   # Ignore the hash of the empty string.
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"File '{s3_location}' has a hash of '{md5_hash}' and size of '{size}'.")
+
+        output_row = {'location': s3_location, 'hash': md5_hash, 'size': size, 'error': error_msg}
+        with lock:
+            output_data.append(output_row)
+
+        # Sleep a bit to avoid overloading the server.
+        if num_seconds_between_requests_in_each_thread > 0:
+            sleep_for_a_bit()   # The success-or-not of the 'sleep' will not play a role in the success of the location.
+
+        return True
+    except Exception as e:
+        error_output_msg = ""
+        if isinstance(e, ClientError):
+            error_response = e.response['Error']['Message']
+            if "Not Found" in error_response:  # Most common error.
+                error_output_msg = "not found"
+            error_msg = f"ClientError for '{s3_location}': {error_response}"
+        elif isinstance(e, NoCredentialsError):
+            error_msg = f"S3 credentials not found."
+            error_output_msg = error_msg
+        elif isinstance(e, EndpointConnectionError):
+            error_msg = f"Connection error: {str(e)}"
+            error_output_msg = "connection error"
+        else:
+            error_msg = str(e)
+            if "Parameter validation failed" in error_msg:
+                logger.error(f"Error when validating parameters 'bucket_name': '{bucket_name}' and 'object_key': '{object_key}'")
+                error_output_msg = "parameter validation error"
+            else:
+                logger.error(f"Unexpected error when downloading file '{s3_location}': {str(e)}")
+                error_output_msg = "unknown error"
+
+        logger.error(error_msg)
+        output_row = {'location': s3_location, 'hash': "null", 'size': "null", 'error': error_output_msg}
+        with lock:
+            output_data.append(output_row)
+        return False
+
+
+def sleep_for_a_bit():
+    try:
+        time.sleep(num_seconds_between_requests_in_each_thread)
+    except InterruptedError as ie:
+        logger.warning(f"Sleep of {num_seconds_between_requests_in_each_thread} seconds was interrupted!")
+    except Exception as e:
+        logger.error(f"Unexpected error when sleeping: {str(e)}")   # Most likely if the time-to-sleep is negative.
+
 
 def wait_for_results_and_write_to_output():
     global futures_of_threads, count_successful_files, output_data
-    for future in as_completed(futures_of_threads):
-        try:
-            if future.result():
-                count_successful_files += 1
-        except Exception as e:
-            logger.error(f"Caught exception: {e}\n{traceback.format_exc()}")
-    futures_of_threads = []  # Reset for next batch.
+    try:
+        for future in as_completed(futures_of_threads):
+            try:
+                if future.result():
+                    count_successful_files += 1
+            except Exception as e:
+                logger.error(f"Caught exception: {e}\n{traceback.format_exc()}")
+        futures_of_threads = []  # Reset for next batch.
 
-    if should_extract_hash_and_size:
-        # Write results to output csv.
-        with open(output_csv_filename, 'a', newline='') as output_csv:
-            output_writer = csv.DictWriter(output_csv, fieldnames=fieldnames)
-            output_writer.writerows(output_data)
-        output_data = []  # Reset for next batch.
+        if should_extract_hash_and_size:
+            # Write results to output csv.
+            with open(output_csv_filename, 'a', newline='') as output_csv:
+                output_writer = csv.DictWriter(output_csv, fieldnames=fieldnames)
+                output_writer.writerows(output_data)
+            output_data = []  # Reset for next batch.
+    except Exception as e:
+        logger.error(f"Caught exception: {e}\n{traceback.format_exc()}")
 
-
-def download_multiple_files_from_s3():
-    global max_files_to_download, num_of_threads, output_data, input_csv_filename
-
+def process_multiple_files_from_s3():
     start_time = time.perf_counter()
 
     with open(input_csv_filename, 'r', newline='') as input_csv:
@@ -169,6 +227,8 @@ def download_multiple_files_from_s3():
             logger.error(f"Error when reading the csv file '{input_csv_filename}': {e}\n{traceback.format_exc()}")
             return False
 
+        s3_client = get_s3_client() # The client can be shared across threads, but not across processes.
+
         # For machines with many CPU cores (> 8), the "ProcessPoolExecutor" is best, otherwise the "ThreadPoolExecutor" is the right choice.
         with ThreadPoolExecutor(max_workers=num_of_threads) as executor:
             total_files_count = 0
@@ -177,18 +237,21 @@ def download_multiple_files_from_s3():
 
             for row in reader:  # Stream through the input_file.
                 #logger.debug(f"row: {row}")
-                file_location = row[0]
-                # print("file_location: " + file_location)
-                if file_location == "location":    # This is the header row.
+                s3_location = row[0]
+                # logger.debug(f"s3_location: {s3_location}")
+                if s3_location == "location":    # This is the header row.
                     continue
 
                 current_batch_files_count += 1
                 total_files_count += 1
 
                 try:
-                    futures_of_threads.append(executor.submit(download_file_from_s3, file_location))
+                    if should_extract_hash_and_size:
+                        futures_of_threads.append(executor.submit(get_metadata, s3_client, s3_location))
+                    else:
+                        futures_of_threads.append(executor.submit(download_file_from_s3, s3_client, s3_location, downloads_dir))
                 except Exception as e:
-                    logger.error(f"Failed to submit task for location: {file_location}")
+                    logger.error(f"Failed to submit task for location: {s3_location}")
                     continue
 
                 if max_files_to_download > 0 and (total_files_count >= max_files_to_download):
@@ -206,12 +269,19 @@ def download_multiple_files_from_s3():
             # If the end of input was reached before the "max_files_reached", wait for the threads to finish and writer thh output results.
                 wait_for_results_and_write_to_output()
 
-        logger.info(f"Successfully processed {count_successful_files} files (out of {total_files_count}), in {(time.perf_counter() - start_time)} seconds.")
+        elapsed_time = (time.perf_counter() - start_time)
+        if elapsed_time > 3600:
+            time_str = f"{round(elapsed_time / 3600, 2)} hours"
+        elif elapsed_time > 60:
+            time_str = f"{round(elapsed_time / 60, 2)} minutes"
+        else:
+            time_str = f"{round(elapsed_time, 2)} seconds"
+        logger.info(f"Successfully processed {count_successful_files} files (out of {total_files_count}), in {time_str}.")
     return True
 
 
 def main():
-    global input_csv_filename, downloads_dir, max_files_to_download, num_of_threads, num_seconds_between_requests_in_each_thread
+    global input_csv_filename, output_csv_filename, downloads_dir, max_files_to_download, num_of_threads, num_seconds_between_requests_in_each_thread
     if len(sys.argv) != 6:  # The 1st arg is this script's name.
         logger.error(f"Invalid arguments-number: {len(sys.argv)}")
         print("Please give exactly 5 arguments: <csv_filename> <downloads_dir> <max_files_to_download> <num_of_threads> <num_seconds_between_requests_in_each_thread>", file=sys.stderr)
@@ -222,6 +292,11 @@ def main():
         logger.error(f"Invalid input file given: {input_csv_filename}")
         print("Please provide a CSV file as input..", file=sys.stderr)
         exit(2)
+
+    if os.sep in input_csv_filename:
+        output_csv_filename = f"result_{input_csv_filename.split(os.sep)[-1]}"
+    else:
+        output_csv_filename = f"result_{input_csv_filename}"
 
     downloads_dir = sys.argv[2]  # e.g. "S3_downloads" directory
     if not os.path.isdir(downloads_dir):
@@ -267,7 +342,7 @@ def main():
             writer = csv.DictWriter(output_csv, fieldnames=fieldnames)
             writer.writeheader()
 
-    download_multiple_files_from_s3()
+    process_multiple_files_from_s3()
     exit(0)
 
 

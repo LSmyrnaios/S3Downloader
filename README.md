@@ -15,8 +15,14 @@ However, that would require additional permission, including the "list-bucket" o
 
 ### Requirements:
 1) Run on a Linux system, with Python3.
-2) The "[**s3cmd**](https://github.com/s3tools/s3cmd)" tool must be installed and configured to use the wanted S3 Object Store.
-3) Have the input CSV file ready.
+2) Install the "**boto3**" dependency: `pip install boto3`
+3) The following environment variables should be set:
+   - ***AWS_ACCESS_KEY_ID***
+   - ***AWS_SECRET_ACCESS_KEY***
+   - ***AWS_REGION***
+   - ***S3_ENDPOINT***
+   - ***S3_BUCKET***
+4) Have the input CSV file ready.
 
 
 ### Run-instructions:
@@ -24,4 +30,4 @@ However, that would require additional permission, including the "list-bucket" o
 
 Notes:<br>
 - If you want to download all the files, then set the "**max_files_to_download**" argument, to **zero** (0).
-- After running experiments, it seems that the number of 64 threads is optimal for an 8-cores CPU.
+- After running experiments, it seems that the number of 4 to 8 threads is optimal for an 8-cores CPU, when collecting the metadata.
