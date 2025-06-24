@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 input_csv_filename = "input_data.csv"   # Will be set by cmd-args.
 downloads_dir = os.path.join(current_dir, "S3_downloads")
 
-max_files_to_download = 100
+max_locations_to_process = 100
 num_of_threads = 20
 num_seconds_between_requests_in_each_thread = 5
 batch_size = 10000
@@ -217,6 +217,10 @@ def wait_for_results_and_write_to_output():
     except Exception as e:
         logger.error(f"Caught exception: {e}\n{traceback.format_exc()}")
 
+
+input_rows_to_skip = 0
+
+
 def process_multiple_files_from_s3():
     start_time = time.perf_counter()
 
@@ -231,19 +235,34 @@ def process_multiple_files_from_s3():
 
         # For machines with many CPU cores (> 8), the "ProcessPoolExecutor" is best, otherwise the "ThreadPoolExecutor" is the right choice.
         with ThreadPoolExecutor(max_workers=num_of_threads) as executor:
-            total_files_count = 0
+            total_locations_count = 0
             current_batch_files_count = 0
-            max_files_reached = False
+            max_locations_reached = False
+
+            if input_rows_to_skip > 0:
+                logger.info(f"Will skip the first {input_rows_to_skip} rows..")
+            skipped_rows = 0
+            rows_count = 0
 
             for row in reader:  # Stream through the input_file.
                 #logger.debug(f"row: {row}")
+                rows_count += 1
+                if 0 < input_rows_to_skip == rows_count:
+                    skipped_rows += 1
+                    continue
+
                 s3_location = row[0]
                 # logger.debug(f"s3_location: {s3_location}")
-                if s3_location == "location":    # This is the header row.
+                if s3_location == "location" or s3_location == "":  # Skip the header row or empty lines.
+                    skipped_rows += 1
+                    continue
+                elif not s3_location.startswith("s3://"):
+                    logger.warning(f"Skipping non-s3_location: '{s3_location}'")
+                    skipped_rows += 1
                     continue
 
                 current_batch_files_count += 1
-                total_files_count += 1
+                total_locations_count += 1
 
                 try:
                     if should_extract_hash_and_size:
@@ -254,19 +273,21 @@ def process_multiple_files_from_s3():
                     logger.error(f"Failed to submit task for location: {s3_location}")
                     continue
 
-                if max_files_to_download > 0 and (total_files_count >= max_files_to_download):
-                    max_files_reached = True
+                if max_locations_to_process > 0 and (total_locations_count >= max_locations_to_process):
+                    max_locations_reached = True
 
-                if max_files_reached or current_batch_files_count >= batch_size:   # Avoid submitting too many tasks to the executors. Wait for existing to finish.
+                if max_locations_reached or current_batch_files_count >= batch_size:   # Avoid submitting too many tasks to the executors. Wait for existing to finish.
                     wait_for_results_and_write_to_output()
-                    if max_files_reached:
+                    if max_locations_reached:
                         break
                     else:
-                        logger.info(f"Processed {total_files_count} locations so far..")
+                        logger.info(f"Processed {total_locations_count} locations so far..")
                         current_batch_files_count = 0 # Reset counting for next batch.
 
-            if not max_files_reached:
-            # If the end of input was reached before the "max_files_reached", wait for the threads to finish and writer thh output results.
+            logger.info(f"Skipped {skipped_rows} rows.")
+
+            if not max_locations_reached:
+            # If the end of input was reached before the "max_locations_reached", wait for the threads to finish and writer thh output results.
                 wait_for_results_and_write_to_output()
 
         elapsed_time = (time.perf_counter() - start_time)
@@ -276,12 +297,12 @@ def process_multiple_files_from_s3():
             time_str = f"{round(elapsed_time / 60, 2)} minutes"
         else:
             time_str = f"{round(elapsed_time, 2)} seconds"
-        logger.info(f"Successfully processed {count_successful_files} files (out of {total_files_count}), in {time_str}.")
+        logger.info(f"Successfully processed {count_successful_files} files (out of {total_locations_count}), in {time_str}.")
     return True
 
 
 def main():
-    global input_csv_filename, output_csv_filename, downloads_dir, max_files_to_download, num_of_threads, num_seconds_between_requests_in_each_thread
+    global input_csv_filename, output_csv_filename, downloads_dir, max_locations_to_process, num_of_threads, num_seconds_between_requests_in_each_thread
     if len(sys.argv) != 6:  # The 1st arg is this script's name.
         logger.error(f"Invalid arguments-number: {len(sys.argv)}")
         print("Please give exactly 5 arguments: <csv_filename> <downloads_dir> <max_files_to_download> <num_of_threads> <num_seconds_between_requests_in_each_thread>", file=sys.stderr)
@@ -308,15 +329,15 @@ def main():
             print("The given download-dir (" + downloads_dir + ") could not be created!\n" + error.__str__(), file=sys.stderr)
             exit(3)
 
-    max_files_to_download = int(sys.argv[3])  # e.g. "1000" files
-    if max_files_to_download < 0:
-        logger.error(f"Invalid 'max_files_to_download' was given: {max_files_to_download}")
+    max_locations_to_process = int(sys.argv[3])  # e.g. "1000" files
+    if max_locations_to_process < 0:
+        logger.error(f"Invalid 'max_files_to_download' was given: {max_locations_to_process}")
         print("Please provide a positive value (including 0) for the 2nd argument \"max_files_to_download\"!", file=sys.stderr)
         exit(4)
-    elif max_files_to_download == 0:
+    elif max_locations_to_process == 0:
         logger.info("Will download all available files.")
     else:
-        logger.info(f"Will download up to {max_files_to_download} files.")
+        logger.info(f"Will download up to {max_locations_to_process} files.")
 
     num_of_threads = int(sys.argv[4])  # e.g. "20" threads
     if num_of_threads <= 0:
