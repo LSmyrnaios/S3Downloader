@@ -22,9 +22,9 @@ current_dir = os.path.abspath(os.path.dirname(__file__))
 config_file_path = os.path.join(current_dir, 'log.ini')
 logging.config.fileConfig(config_file_path)
 
-logging.getLogger('boto3').setLevel(logging.INFO)
-logging.getLogger('botocore').setLevel(logging.INFO)
-logging.getLogger('urllib3').setLevel(logging.INFO)
+logging.getLogger('boto3').setLevel(logging.WARNING)
+logging.getLogger('botocore').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,8 @@ downloads_dir = os.path.join(current_dir, "S3_downloads")
 max_locations_to_process = 100
 num_of_threads = 20
 num_seconds_between_requests_in_each_thread = 5
-batch_size = 10000
+batch_size = 500_000    # 100_000 is about 40 seconds of run time, if getting only the hash & size, for non-multipart-files.
+# Put -even- 500k or more, for getting metadata, especially non-multiparts, but not more than 100_000 when downloading the files.. as it will take more minutes and things may go sideways, losing intermediate results.
 
 should_extract_hash_and_size = True
 #lock = threading.Lock()    # If we ever need to synchronize some part of the code.
@@ -377,7 +378,9 @@ def main():
         exit(2)
 
     if os.sep in input_csv_filename:
-        output_csv_filename = f"result_{input_csv_filename.split(os.sep)[-1]}"
+        input_csv_filename_parts = input_csv_filename.split(os.sep)
+        input_base_path = os.sep.join(input_csv_filename_parts[0:-1])
+        output_csv_filename = os.path.join(input_base_path, f"result_{input_csv_filename_parts[-1]}")
     else:
         output_csv_filename = f"result_{input_csv_filename}"
 
