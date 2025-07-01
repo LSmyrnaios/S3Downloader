@@ -1,8 +1,9 @@
 import csv
+import hashlib
 import logging.config
 import os
 import sys
-import threading
+#import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +11,8 @@ from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError, EndpointConnectionError
+
+import atomic_counter
 
 # Ensure the logs directory exists
 logs_dir = os.path.join(os.path.dirname(__file__), "logs")
@@ -34,8 +37,7 @@ num_seconds_between_requests_in_each_thread = 5
 batch_size = 10000
 
 should_extract_hash_and_size = True
-output_data = []
-lock = threading.Lock()
+#lock = threading.Lock()    # If we ever need to synchronize some part of the code.
 
 output_csv_filename = "result_data.csv"   # Will be set after the "input_csv_filename", given from cmd-args.
 fieldnames = ['location', 'hash', 'size', 'error']
@@ -77,27 +79,35 @@ def parse_s3_location(s3_location):
         return None, None
 
 
-def download_file_from_s3(s3_client, s3_location, downloads_dir):
+def check_s3_location_parts_for_download_only(s3_location):
     bucket_name, object_key = parse_s3_location(s3_location)
     if bucket_name is None and object_key is None:
-        return False
+        return None, None
 
     if bucket_name != expected_bucket:
         logger.error(
             f"The S3_location '{s3_location}' has an unexpected bucket: '{bucket_name}' (not the expected one: '{expected_bucket}')")
         # Even if its valid, the credentials we use are only applicable for the 'expected_bucket'.
-        return False
+        return None, None
 
+    return bucket_name, object_key
+
+
+def process_file_for_downloading(s3_client, s3_location, downloads_dir):
+    bucket_name, object_key = check_s3_location_parts_for_download_only(s3_location)
+    download_result = download_file_from_s3(s3_client, s3_location, bucket_name, object_key, downloads_dir)
+    # Sleep a bit to avoid overloading the server.
+    if num_seconds_between_requests_in_each_thread > 0:
+        time.sleep(num_seconds_between_requests_in_each_thread)
+    return None != download_result
+
+
+def download_file_from_s3(s3_client, s3_location, bucket_name, object_key, downloads_dir):
     try:
         local_file_path = os.path.join(downloads_dir, object_key.split('/')[1])
         s3_client.download_file(bucket_name, object_key, local_file_path)
-        logger.info(f"Downloaded '{s3_location}'.")
-
-        # Sleep a bit to avoid overloading the server.
-        if num_seconds_between_requests_in_each_thread > 0:
-            time.sleep(num_seconds_between_requests_in_each_thread)
-
-        return True
+        logger.debug(f"Downloaded '{s3_location}'.")
+        return local_file_path
     except Exception as e:
         if isinstance(e, ClientError):
             logger.error(f"Failed to download file '{s3_location}': {e.response['Error']['Message']}")
@@ -111,10 +121,59 @@ def download_file_from_s3(s3_client, s3_location, downloads_dir):
                 logger.error(f"Error when validating parameters 'bucket_name': '{bucket_name}' and 'object_key': '{object_key}'")
             else:
                 logger.error(f"Unexpected error when downloading file '{s3_location}': {str(e)}")
-        return False
+        return None
 
 
-def get_metadata(s3_client, s3_location):
+should_check_and_switch_metadata_strategy = True
+# The above boolean is used to identify multiple multipart-cases and auto-switch to direct file-download, in case there are many pf suck cases.
+threashold_to_switch_metadata_strategy = 10000
+should_download_file_to_get_metadata = False    # It may change to True later..
+multipart_counter = atomic_counter.AtomicCounter()
+regular_counter = atomic_counter.AtomicCounter()
+
+
+def calculate_hash_and_size_from_file(filepath, s3_location):
+    try:
+        md5 = hashlib.md5() # New md5-object for this file.
+        file_size = 0
+        with open(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(1_048_576), b''):  # 1MB buffer_size
+                # (for empty file, it will not enter the loop)
+                md5.update(chunk)
+                file_size += len(chunk) # The length may be less than 1MB.
+
+        error_msg = "null"
+        if file_size == 0:
+            error_msg = "empty file"
+            logger.warning(f"Found an {error_msg}: {s3_location}")
+            md5_hash = "null"  # Ignore the hash of the empty string.
+        else:
+            md5_hash = md5.hexdigest()
+        return md5_hash, file_size, error_msg
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Could not calculate hash and/or size of file '{filepath}': {error_msg}\n{traceback.format_exc()}")
+        return "null", "null", error_msg
+
+
+def download_file_and_get_metadata(s3_client, s3_location, bucket_name, object_key, downloads_dir):
+    filepath = download_file_from_s3(s3_client, s3_location, bucket_name, object_key, downloads_dir)
+    if filepath is None:
+        if num_seconds_between_requests_in_each_thread > 0:
+            sleep_for_a_bit()  # The success-or-not of the 'sleep' will not play a role in the success of the location.
+        return {'location': s3_location, 'hash': 'null', 'size': 'null', 'error': 'could_not_download_file_to_get_metadata'}
+    else:
+        md5_hash, size, error_msg = calculate_hash_and_size_from_file(filepath, s3_location)
+        try:
+            os.remove(filepath)
+        except Exception as e:
+            logger.error(f"Failed to remove file '{filepath}': {e}")
+            # Do not return "False", we got the metadata.
+        return {'location': s3_location, 'hash': md5_hash, 'size': size, 'error': error_msg}
+
+
+def get_metadata(s3_client, s3_location, downloads_dir):
+    global should_download_file_to_get_metadata
     bucket_name, object_key = parse_s3_location(s3_location)
     error_msg = None
     if bucket_name is None and object_key is None:
@@ -126,20 +185,31 @@ def get_metadata(s3_client, s3_location):
         # Even if its valid, the credentials we use are only applicable for the 'expected_bucket'.
 
     if error_msg:
-        output_row = {'location': s3_location, 'hash': "null", 'size': "null", 'error': error_msg}
-        with lock:
-            output_data.append(output_row)
-        return False
+        return {'location': s3_location, 'hash': 'null', 'size': 'null', 'error': error_msg}
+
+    if should_download_file_to_get_metadata:    # We have switched to "download_and_get_metadata", do that immediately.
+        return download_file_and_get_metadata(s3_client, s3_location, bucket_name, object_key, downloads_dir)
 
     try:
         response = s3_client.head_object(Bucket= bucket_name, Key=object_key)
         error_msg = "null"
         md5_hash = response['ETag'].strip('"')
         if '-' in md5_hash:
-            error_msg = "multipart file"
-            logger.warning(f"Found a {error_msg}, for which we cannot get its md5Sum: {s3_location}")
-            md5_hash = "null"
-            # In this case, the 'size' represents the whole object, so we can at least get that.
+            multipart_counter.increment()
+            logger.warning(f"Found a multipart file, for which we have to download and calculate its md5Sum: {s3_location}")
+            # Will increase the counter (if set) and proceed with downloading and calculating the metadata.
+            # For the first <threashold> cases, we do first head and then download the file if needed
+            # Afterward, if at any moment the number of multipart-files exceed the number of regulars, then for all remaining locations..
+            # we will download and calculate the files, to avoid double connections (headh AND then download) for most of the files (the multiparts in that case).
+            if should_check_and_switch_metadata_strategy \
+                and multipart_counter.get_value() >= threashold_to_switch_metadata_strategy \
+                    and multipart_counter.get_value() > (regular_counter.get_value() * 1.1):    # We want the multipart-cases to be more than 10% over the regulars.
+                logger.warning(f"Reached threashold of {threashold_to_switch_metadata_strategy} locations to be multipart-files. Will proceed with immediate download and calculation for all remaining locations..")
+                should_download_file_to_get_metadata = True
+
+            return download_file_and_get_metadata(s3_client, s3_location, bucket_name, object_key, downloads_dir)
+        else:
+            regular_counter.increment()
 
         size = response['ContentLength']
         if size == "0":
@@ -150,15 +220,7 @@ def get_metadata(s3_client, s3_location):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"File '{s3_location}' has a hash of '{md5_hash}' and size of '{size}'.")
 
-        output_row = {'location': s3_location, 'hash': md5_hash, 'size': size, 'error': error_msg}
-        with lock:
-            output_data.append(output_row)
-
-        # Sleep a bit to avoid overloading the server.
-        if num_seconds_between_requests_in_each_thread > 0:
-            sleep_for_a_bit()   # The success-or-not of the 'sleep' will not play a role in the success of the location.
-
-        return True
+        return {'location': s3_location, 'hash': md5_hash, 'size': size, 'error': error_msg}
     except Exception as e:
         error_output_msg = ""
         if isinstance(e, ClientError):
@@ -182,10 +244,7 @@ def get_metadata(s3_client, s3_location):
                 error_output_msg = "unknown error"
 
         logger.error(error_msg)
-        output_row = {'location': s3_location, 'hash': "null", 'size': "null", 'error': error_output_msg}
-        with lock:
-            output_data.append(output_row)
-        return False
+        return {'location': s3_location, 'hash': 'null', 'size': 'null', 'error': error_output_msg}
 
 
 def sleep_for_a_bit():
@@ -198,11 +257,15 @@ def sleep_for_a_bit():
 
 
 def wait_for_results_and_write_to_output():
-    global futures_of_threads, count_successful_files, output_data
+    global futures_of_threads, count_successful_files
+    output_data = []
     try:
         for future in as_completed(futures_of_threads):
             try:
-                if future.result():
+                row_result = future.result()
+                if should_extract_hash_and_size:
+                    output_data.append(row_result)
+                if row_result['error'] == 'null':
                     count_successful_files += 1
             except Exception as e:
                 logger.error(f"Caught exception: {e}\n{traceback.format_exc()}")
@@ -213,7 +276,6 @@ def wait_for_results_and_write_to_output():
             with open(output_csv_filename, 'a', newline='') as output_csv:
                 output_writer = csv.DictWriter(output_csv, fieldnames=fieldnames)
                 output_writer.writerows(output_data)
-            output_data = []  # Reset for next batch.
     except Exception as e:
         logger.error(f"Caught exception: {e}\n{traceback.format_exc()}")
 
@@ -266,9 +328,9 @@ def process_multiple_files_from_s3():
 
                 try:
                     if should_extract_hash_and_size:
-                        futures_of_threads.append(executor.submit(get_metadata, s3_client, s3_location))
+                        futures_of_threads.append(executor.submit(get_metadata, s3_client, s3_location, downloads_dir))
                     else:
-                        futures_of_threads.append(executor.submit(download_file_from_s3, s3_client, s3_location, downloads_dir))
+                        futures_of_threads.append(executor.submit(process_file_for_downloading, s3_client, s3_location, downloads_dir))
                 except Exception as e:
                     logger.error(f"Failed to submit task for location: {s3_location}")
                     continue
