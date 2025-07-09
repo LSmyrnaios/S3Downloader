@@ -27,6 +27,7 @@ logging.getLogger('botocore').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+#logger.setLevel(logging.DEBUG)
 
 input_csv_filename = "input_data.csv"   # Will be set by cmd-args.
 downloads_dir = os.path.join(current_dir, "S3_downloads")
@@ -266,8 +267,10 @@ def wait_for_results_and_write_to_output():
                 row_result = future.result()
                 if should_extract_hash_and_size:
                     output_data.append(row_result)
-                if row_result['error'] == 'null':
-                    count_successful_files += 1
+                    if row_result['error'] == 'null':
+                        count_successful_files += 1
+                elif row_result:
+                        count_successful_files += 1
             except Exception as e:
                 logger.error(f"Caught exception: {e}\n{traceback.format_exc()}")
         futures_of_threads = []  # Reset for next batch.
