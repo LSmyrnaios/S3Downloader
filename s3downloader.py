@@ -43,6 +43,7 @@ should_extract_hash_and_size = True
 
 output_csv_filename = "result_data.csv"   # Will be set after the "input_csv_filename", given from cmd-args.
 fieldnames = ['location', 'hash', 'size', 'error']
+header_fields = []
 
 count_successful_files = 0
 futures_of_threads = []
@@ -95,13 +96,17 @@ def check_s3_location_parts_for_download_only(s3_location):
     return bucket_name, object_key
 
 
-def process_file_for_downloading(s3_client, s3_location, downloads_dir):
+def process_file_for_downloading(s3_client, s3_location, downloads_dir, rest_input_columns):
     bucket_name, object_key = check_s3_location_parts_for_download_only(s3_location)
     download_result = download_file_from_s3(s3_client, s3_location, bucket_name, object_key, downloads_dir)
+    result_values = [download_result] + rest_input_columns
     # Sleep a bit to avoid overloading the server.
     if num_seconds_between_requests_in_each_thread > 0:
         time.sleep(num_seconds_between_requests_in_each_thread)
-    return None != download_result
+
+    result_dict = dict(zip(header_fields, result_values))
+    #logger.debug(f"{result_dict}")
+    return result_dict
 
 
 def download_file_from_s3(s3_client, s3_location, bucket_name, object_key, downloads_dir):
@@ -259,7 +264,7 @@ def sleep_for_a_bit():
 
 
 def wait_for_results_and_write_to_output():
-    global futures_of_threads, count_successful_files
+    global futures_of_threads, count_successful_files, header_fields
     output_data = []
     try:
         for future in as_completed(futures_of_threads):
@@ -269,17 +274,17 @@ def wait_for_results_and_write_to_output():
                     output_data.append(row_result)
                     if row_result['error'] == 'null':
                         count_successful_files += 1
-                elif row_result:
-                        count_successful_files += 1
+                elif row_result is not None:
+                    output_data.append(row_result)
+                    count_successful_files += 1
             except Exception as e:
                 logger.error(f"Caught exception: {e}\n{traceback.format_exc()}")
         futures_of_threads = []  # Reset for next batch.
 
-        if should_extract_hash_and_size:
-            # Write results to output csv.
-            with open(output_csv_filename, 'a', newline='') as output_csv:
-                output_writer = csv.DictWriter(output_csv, fieldnames=fieldnames)
-                output_writer.writerows(output_data)
+        # Write results to output csv.
+        with open(output_csv_filename, 'a', newline='') as output_csv:
+            output_writer = csv.DictWriter(output_csv, fieldnames=header_fields)
+            output_writer.writerows(output_data)
     except Exception as e:
         logger.error(f"Caught exception: {e}\n{traceback.format_exc()}")
 
@@ -288,6 +293,7 @@ input_rows_to_skip = 0
 
 
 def process_multiple_files_from_s3():
+    global header_fields
     start_time = time.perf_counter()
 
     with open(input_csv_filename, 'r', newline='') as input_csv:
@@ -313,19 +319,34 @@ def process_multiple_files_from_s3():
             for row in reader:  # Stream through the input_file.
                 #logger.debug(f"row: {row}")
                 rows_count += 1
+                if rows_count == 1:
+                    # Initialize the output-file.
+                    if should_extract_hash_and_size:
+                        header_fields = fieldnames
+                    else:
+                        header_fields = row
+                    logger.info(f"Will (re)create the output file '{output_csv_filename}'.")
+                    with open(output_csv_filename, 'w', newline='') as output_csv:
+                        writer = csv.DictWriter(output_csv, fieldnames=header_fields)
+                        writer.writeheader()
+                    skipped_rows += 1
+                    continue
+
                 if 0 < input_rows_to_skip == rows_count:
                     skipped_rows += 1
                     continue
 
                 s3_location = row[0]
                 # logger.debug(f"s3_location: {s3_location}")
-                if s3_location == "location" or s3_location == "":  # Skip the header row or empty lines.
+                if s3_location == "":  # Skip empty locations.
                     skipped_rows += 1
                     continue
                 elif not s3_location.startswith("s3://"):
                     logger.warning(f"Skipping non-s3_location: '{s3_location}'")
                     skipped_rows += 1
                     continue
+
+                rest_input_columns = row[1:]  # All columns except the first one
 
                 current_batch_files_count += 1
                 total_locations_count += 1
@@ -334,7 +355,7 @@ def process_multiple_files_from_s3():
                     if should_extract_hash_and_size:
                         futures_of_threads.append(executor.submit(get_metadata, s3_client, s3_location, downloads_dir))
                     else:
-                        futures_of_threads.append(executor.submit(process_file_for_downloading, s3_client, s3_location, downloads_dir))
+                        futures_of_threads.append(executor.submit(process_file_for_downloading, s3_client, s3_location, downloads_dir, rest_input_columns))
                 except Exception as e:
                     logger.error(f"Failed to submit task for location: {s3_location}")
                     continue
@@ -424,12 +445,6 @@ def main():
         logger.info("Will download the files with 0 sleep between requests.")
     else:
         logger.info(f"Will apply a sleep between requests of {num_seconds_between_requests_in_each_thread} seconds.")
-
-    if should_extract_hash_and_size:
-        logger.info(f"Will (re)create the output file '{output_csv_filename}'.")
-        with open(output_csv_filename, 'w', newline='') as output_csv:
-            writer = csv.DictWriter(output_csv, fieldnames=fieldnames)
-            writer.writeheader()
 
     process_multiple_files_from_s3()
     exit(0)
