@@ -38,7 +38,7 @@ num_seconds_between_requests_in_each_thread = 5
 batch_size = 500_000    # 100_000 is about 40 seconds of run time, if getting only the hash & size, for non-multipart-files.
 # Put -even- 500k or more, for getting metadata, especially non-multiparts, but not more than 100_000 when downloading the files.. as it will take more minutes and things may go sideways, losing intermediate results.
 
-should_extract_hash_and_size = True
+should_extract_hash_and_size = False
 #lock = threading.Lock()    # If we ever need to synchronize some part of the code.
 
 output_csv_filename = "result_data.csv"   # Will be set after the "input_csv_filename", given from cmd-args.
@@ -393,10 +393,11 @@ def process_multiple_files_from_s3():
 
 
 def main():
-    global input_csv_filename, output_csv_filename, downloads_dir, max_locations_to_process, num_of_threads, num_seconds_between_requests_in_each_thread
-    if len(sys.argv) != 6:  # The 1st arg is this script's name.
+    global input_csv_filename, output_csv_filename, downloads_dir, max_locations_to_process, num_of_threads,\
+        num_seconds_between_requests_in_each_thread, should_extract_hash_and_size
+    if len(sys.argv) != 7:  # The 1st arg is this script's name.
         logger.error(f"Invalid arguments-number: {len(sys.argv)}")
-        print("Please give exactly 5 arguments: <csv_filename> <downloads_dir> <max_files_to_download> <num_of_threads> <num_seconds_between_requests_in_each_thread>", file=sys.stderr)
+        print("Please give exactly 6 arguments: <csv_filename> <downloads_dir> <max_locations_to_process> <num_of_threads> <num_seconds_between_requests_in_each_thread> <should_extract_hash_and_size>", file=sys.stderr)
         exit(1)
 
     input_csv_filename = sys.argv[1]  # e.g. "input_data.csv" input-file
@@ -452,6 +453,16 @@ def main():
         logger.info("Will download the files with 0 sleep between requests.")
     else:
         logger.info(f"Will apply a sleep between requests of {num_seconds_between_requests_in_each_thread} seconds.")
+
+    should_extract_hash_and_size = int(sys.argv[6])  # e.g. "1" for "True" and "2" for "False"
+    if should_extract_hash_and_size < 0 or should_extract_hash_and_size > 1:
+        logger.error(f"Invalid 'should_extract_hash_and_size' was given: {should_extract_hash_and_size}")
+        print("Please provide a '0' or '1' value for the 6th argument \"should_extract_hash_and_size\"!", file=sys.stderr)
+        exit(7)
+    elif should_extract_hash_and_size == 0:
+        logger.info(f"Will only download the files from the provided locations.")
+    else:
+        logger.info(f"Will try to extract the hash and size for the files of the provided locations.")
 
     process_multiple_files_from_s3()
     exit(0)
