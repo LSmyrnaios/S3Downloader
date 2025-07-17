@@ -99,6 +99,9 @@ def check_s3_location_parts_for_download_only(s3_location):
 def process_file_for_downloading(s3_client, s3_location, downloads_dir, rest_input_columns):
     bucket_name, object_key = check_s3_location_parts_for_download_only(s3_location)
     download_result = download_file_from_s3(s3_client, s3_location, bucket_name, object_key, downloads_dir)
+    if download_result is None:
+        download_result = "null"
+
     result_values = [download_result] + rest_input_columns
     # Sleep a bit to avoid overloading the server.
     if num_seconds_between_requests_in_each_thread > 0:
@@ -274,9 +277,10 @@ def wait_for_results_and_write_to_output():
                     output_data.append(row_result)
                     if row_result['error'] == 'null':
                         count_successful_files += 1
-                elif row_result is not None:
+                else:
                     output_data.append(row_result)
-                    count_successful_files += 1
+                    if row_result[header_fields.__getitem__(0)] != "null":
+                        count_successful_files += 1
             except Exception as e:
                 logger.error(f"Caught exception: {e}\n{traceback.format_exc()}")
         futures_of_threads = []  # Reset for next batch.
@@ -398,7 +402,7 @@ def main():
     input_csv_filename = sys.argv[1]  # e.g. "input_data.csv" input-file
     if not input_csv_filename.endswith(".csv"):
         logger.error(f"Invalid input file given: {input_csv_filename}")
-        print("Please provide a CSV file as input..", file=sys.stderr)
+        print("Please provide a CSV file as input, in the 1st argument..", file=sys.stderr)
         exit(2)
 
     if os.sep in input_csv_filename:
@@ -409,6 +413,9 @@ def main():
         output_csv_filename = f"result_{input_csv_filename}"
 
     downloads_dir = sys.argv[2]  # e.g. "S3_downloads" directory
+    if not downloads_dir.startswith('/'):   # Check if a relative path is given
+        downloads_dir = os.path.join(os.getcwd(), downloads_dir)    # Create the full-directory-path.
+
     if not os.path.isdir(downloads_dir):
         logger.info(f"Will create the downloads_dir: {downloads_dir}")
         try:
@@ -420,18 +427,18 @@ def main():
 
     max_locations_to_process = int(sys.argv[3])  # e.g. "1000" files
     if max_locations_to_process < 0:
-        logger.error(f"Invalid 'max_files_to_download' was given: {max_locations_to_process}")
-        print("Please provide a positive value (including 0) for the 2nd argument \"max_files_to_download\"!", file=sys.stderr)
+        logger.error(f"Invalid 'max_locations_to_process' was given: {max_locations_to_process}")
+        print("Please provide a positive value (including 0) for the 3rd argument \"max_locations_to_process\"!", file=sys.stderr)
         exit(4)
     elif max_locations_to_process == 0:
-        logger.info("Will download all available files.")
+        logger.info("Will process all provided locations.")
     else:
-        logger.info(f"Will download up to {max_locations_to_process} files.")
+        logger.info(f"Will process up to {max_locations_to_process} locations.")
 
     num_of_threads = int(sys.argv[4])  # e.g. "20" threads
     if num_of_threads <= 0:
         logger.error(f"Invalid 'num_of_threads' was given: {num_of_threads}")
-        print("Please provide an above-zero value for the 3rd argument \"num_of_threads\"!", file=sys.stderr)
+        print("Please provide an above-zero value for the 4th argument \"num_of_threads\"!", file=sys.stderr)
         exit(5)
     else:
         logger.info(f"Will download the files using {num_of_threads} threads.")
@@ -439,7 +446,7 @@ def main():
     num_seconds_between_requests_in_each_thread = int(sys.argv[5])  # e.g. "5" seconds
     if num_seconds_between_requests_in_each_thread < 0:
         logger.error(f"Invalid 'num_seconds_between_requests_in_each_thread' was given: {num_seconds_between_requests_in_each_thread}")
-        print("Please provide a positive value (including 0) for the 4th argument \"num_seconds_between_requests_in_each_thread\"!", file=sys.stderr)
+        print("Please provide a positive value (including 0) for the 5th argument \"num_seconds_between_requests_in_each_thread\"!", file=sys.stderr)
         exit(6)
     elif num_seconds_between_requests_in_each_thread == 0:
         logger.info("Will download the files with 0 sleep between requests.")
